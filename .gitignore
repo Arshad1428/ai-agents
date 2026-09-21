@@ -5,12 +5,14 @@ __pycache__/
 
 # Virtual environments
 .venv/
-open-webui-venv/
 venv/
 env/
+.openwebui-venv/
+open-webui-venv/
 
-# Environment variables
+# Secrets / environment variables
 .env
+.webui_secret_key
 
 # Jupyter
 .ipynb_checkpoints/

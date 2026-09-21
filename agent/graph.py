@@ -1,3 +1,5 @@
+from datetime import date
+
 from langchain_core.messages import SystemMessage
 from langchain_ollama import ChatOllama
 
@@ -6,7 +8,11 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from agent.config import (
     OLLAMA_BASE_URL,
+    OLLAMA_KEEP_ALIVE,
     OLLAMA_MODEL,
+    OLLAMA_NUM_CTX,
+    OLLAMA_NUM_PREDICT,
+    OLLAMA_TIMEOUT,
 )
 from agent.state import AgentState
 
@@ -18,24 +24,30 @@ from tools.search import web_search
 # LLM
 # --------------------------------------------------
 
+# disable_streaming=True: avoids the streaming path that stalled for us.
+# client_kwargs timeout: a stalled Ollama call raises an error instead of
+# hanging forever.
 llm = ChatOllama(
     model=OLLAMA_MODEL,
     base_url=OLLAMA_BASE_URL,
     temperature=0,
+    disable_streaming=True,
+    num_ctx=OLLAMA_NUM_CTX,
+    num_predict=OLLAMA_NUM_PREDICT,
+    keep_alive=OLLAMA_KEEP_ALIVE,
+    client_kwargs={"timeout": OLLAMA_TIMEOUT},
 )
-
-
-# --------------------------------------------------
-# Tools
-# --------------------------------------------------
 
 tools = [
     calculator,
     web_search,
 ]
 
-
 llm_with_tools = llm.bind_tools(tools)
+
+# Plain model without tools. Used for background tasks such as chat title
+# generation, so they never trigger web searches.
+plain_llm = llm
 
 
 # --------------------------------------------------
@@ -43,26 +55,23 @@ llm_with_tools = llm.bind_tools(tools)
 # --------------------------------------------------
 
 SYSTEM_PROMPT = """
-You are a research assistant that uses tools.
+You are a research assistant with two tools.
 
-You have access to these tools:
+Today's date is {today}.
 
-1. calculator
-   Use this whenever the user asks you to perform
-   a mathematical calculation.
+- calculator: use for any arithmetic.
+- web_search: use for current, recent, or externally verifiable facts.
 
-2. web_search
-   Use this whenever the user asks for current,
-   recent, factual, or externally verifiable information.
-
-Important rules:
-
-- Do not say that you will use a tool without actually calling it.
-- If web_search is needed, call web_search before answering.
-- If calculator is needed, call calculator before answering.
-- Use the information returned by the tools to formulate your answer.
-- For current information, do not rely only on your built-in knowledge.
-- After receiving tool results, answer the user's question clearly.
+Rules:
+- If a tool is needed, call it before answering. Never say you will use a
+  tool without calling it.
+- Base your answer on the tool results. Prefer the most recent dated
+  information, and do not fall back on older values from memory.
+- Do not invent facts. If the results do not clearly answer the question,
+  say the available results are insufficient.
+- Do not repeat the same search. Try at most one clearly different query,
+  then answer with what you have.
+- Be concise.
 """
 
 
@@ -71,25 +80,13 @@ Important rules:
 # --------------------------------------------------
 
 def agent_node(state: AgentState):
-    messages = state["messages"]
-
-    response = llm_with_tools.invoke(
-        [
-            SystemMessage(content=SYSTEM_PROMPT),
-            *messages,
-        ]
+    system = SystemMessage(
+        content=SYSTEM_PROMPT.format(today=date.today().isoformat())
     )
 
-    return {
-        "messages": [response],
-    }
+    response = llm_with_tools.invoke([system, *state["messages"]])
 
-
-# --------------------------------------------------
-# Tool node
-# --------------------------------------------------
-
-tool_node = ToolNode(tools)
+    return {"messages": [response]}
 
 
 # --------------------------------------------------
@@ -98,42 +95,11 @@ tool_node = ToolNode(tools)
 
 builder = StateGraph(AgentState)
 
+builder.add_node("agent", agent_node)
+builder.add_node("tools", ToolNode(tools))
 
-builder.add_node(
-    "agent",
-    agent_node,
-)
-
-builder.add_node(
-    "tools",
-    tool_node,
-)
-
-
-# START → agent
-
-builder.add_edge(
-    START,
-    "agent",
-)
-
-
-# agent → tools OR END
-
-builder.add_conditional_edges(
-    "agent",
-    tools_condition,
-)
-
-
-# tools → agent
-
-builder.add_edge(
-    "tools",
-    "agent",
-)
-
-
-# Compile
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)
+builder.add_edge("tools", "agent")
 
 app = builder.compile()
